@@ -1,0 +1,17 @@
+[project]
+name = "sustech-schedule-planner"
+version = "2.0.0"
+description = "南科大智能课表规划器：无冲突求解 + NCES 评分 + Web 界面"
+requires-python = ">=3.10"
+authors = [{ name = "Yunqi Zhong", email = "2324811869@qq.com" }]
+dependencies = [
+    "requests",
+    "pyyaml",
+    "rich",
+    "colorama",
+    "flask",
+]
+
+[project.scripts]
+solve = "src.main:main"
+web = "src.web_app:main"

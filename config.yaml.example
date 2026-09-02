@@ -1,0 +1,28 @@
+# 南科大智能课表规划器配置文件
+# 使用方法：复制本文件为 config.yaml，然后填入你的真实信息
+#   cp config.yaml.example config.yaml
+
+# CAS 登录凭据
+# 方式一：直接填写（方便但注意不要泄露）
+# 方式二：留空，运行时交互式输入
+# 方式三：设置环境变量 SUSTECH_SID 和 SUSTECH_PWD
+student_id: ""
+password: ""
+
+# 在 courses 列表中填写你想选的课程名称
+# 名称需与 TIS 系统中显示的一致（不需要带班号，如"高等数学（下）"而非"高等数学（下）-01班-双语"）
+# 程序会自动匹配该课程下所有可选的教学班
+courses:
+  - "高等数学（下）"
+  - "大学物理（下）"
+  - "线性代数"
+  - "概率论与数理统计"
+  - "大学化学"
+
+# 是否从牛娃课程评价社区 (NCES) 获取评分并按总分排序（默认 true）
+use_ratings: true
+
+# 求解剪枝（启用 use_ratings 时生效）
+min_rating: 5.0              # NCES 低于此分的教学班直接排除；无评分的班保留
+max_sections_per_course: 12  # 每门课最多保留多少个教学班（按评分从高到低）
+max_results: 100             # 最多输出多少种无冲突方案
