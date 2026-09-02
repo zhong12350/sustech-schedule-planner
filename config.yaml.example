@@ -19,6 +19,27 @@ courses:
   - "概率论与数理统计"
   - "大学化学"
 
+# 课程组：某一类课 N 选 1（无需列出该类全部课程）
+# 先用  python scripts/export_tis_catalog.py  或 Web「查看类别」确认 category 名称
+course_groups:
+  - name: "通识选修-人文"
+    pick: 1
+    course_type: xxxk       # 通识选修选课
+    category: "人文"        # 与 TIS 类别字段模糊匹配
+    max_courses: 80         # 候选过多时按评分保留 top N
+
+  - name: "通识选修-社科"
+    pick: 1
+    course_type: xxxk
+    category: "社科"
+
+  # 也可手动指定小范围候选（不必写全校）：
+  # - name: "艺术课二选一"
+  #   pick: 1
+  #   candidates:
+  #     - "宋代院体工笔花鸟画临习"
+  #     - "艺术鉴赏"
+
 # 是否从牛娃课程评价社区 (NCES) 获取评分并按总分排序（默认 true）
 use_ratings: true
 

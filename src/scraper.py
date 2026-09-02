@@ -36,6 +36,25 @@ TIME_PATTERN = re.compile(r"星期([一二三四五六日])第(\d+)-(\d+)节")
 
 LOCATION_FIELDS = ("jxdd", "skdd", "cdmc", "jxbdd", "jsmc")
 
+# 正方 TIS 常见类别字段
+CATEGORY_FIELDS = (
+    "kclbmc",
+    "tsxxlbmc",
+    "xkmlmc",
+    "kcxzmc",
+    "lbmc",
+    "kclb",
+)
+
+
+def extract_category_from_item(item: dict) -> str:
+    """从 TIS 原始条目提取课程子类/类别名。"""
+    for fld in CATEGORY_FIELDS:
+        val = item.get(fld)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
 
 def _extract_time_and_location(item: dict) -> tuple[str, str]:
     """从 TIS 课程条目提取上课时间与地点。"""
@@ -257,6 +276,7 @@ def fetch_all_courses(
                 teacher = item.get("dgjsmc", "") or ""
 
                 time_str, location = _extract_time_and_location(item)
+                category = extract_category_from_item(item)
 
                 time_slots = parse_time_slots(time_str)
 
@@ -270,6 +290,7 @@ def fetch_all_courses(
                     section_name=display_name,
                     section_id=section_id,
                     course_type=c_type,
+                    category=category,
                     time_slots=time_slots,
                     teacher=teacher,
                     location=location,

@@ -196,6 +196,19 @@
       </div>
 
       <div class="card">
+        <h2>课程组（某一类 N 选 1）</h2>
+        <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0.75rem">
+          如通识选修的人文/社科：只需指定类别，程序从 TIS 自动载入该类全部候选课并选 1 门
+        </p>
+        <div id="group_list"></div>
+        <div class="row" style="margin-top:0.75rem">
+          <button class="btn btn-sm" type="button" onclick="addCourseGroup()">添加课程组</button>
+          <button class="btn btn-sm" type="button" onclick="fetchCategories()">查看 TIS 类别</button>
+        </div>
+        <pre id="category_hint" style="display:none;margin-top:0.75rem;font-size:0.75rem;color:var(--muted);white-space:pre-wrap;max-height:160px;overflow:auto"></pre>
+      </div>
+
+      <div class="card">
         <h2>课表偏好</h2>
         <div class="checkbox-row">
           <input type="checkbox" id="no_early_morning">
@@ -266,6 +279,7 @@
   <script>
     const WEEKDAYS = ['周一','周二','周三','周四','周五'];
     let courses = [];
+    let courseGroups = [];
     let pendingSessionId = null;
     let pendingAmbiguous = [];
     let pendingResolutions = {};
@@ -303,6 +317,73 @@
         el.appendChild(tag);
       });
     }
+
+    function addCourseGroup() {
+      courseGroups.push({ name: '通识选修-人文', pick: 1, course_type: 'xxxk', category: '人文', max_courses: 80 });
+      renderCourseGroups();
+    }
+
+    function removeCourseGroup(i) {
+      courseGroups.splice(i, 1);
+      renderCourseGroups();
+    }
+
+    function renderCourseGroups() {
+      const el = document.getElementById('group_list');
+      if (!courseGroups.length) {
+        el.innerHTML = '<p style="color:var(--muted);font-size:0.85rem">暂无课程组</p>';
+        return;
+      }
+      el.innerHTML = courseGroups.map((g, i) => `
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.75rem;margin-bottom:0.5rem">
+          <div class="row">
+            <div><label>组名</label><input type="text" value="${g.name}" onchange="courseGroups[${i}].name=this.value"></div>
+            <div><label>选几门</label><input type="number" min="1" max="5" value="${g.pick}" style="width:100%"
+              onchange="courseGroups[${i}].pick=parseInt(this.value,10)||1"></div>
+          </div>
+          <div class="row" style="margin-top:0.5rem">
+            <div><label>选课类型</label>
+              <select onchange="courseGroups[${i}].course_type=this.value" style="width:100%;padding:0.5rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px">
+                <option value="xxxk" ${g.course_type==='xxxk'?'selected':''}>通识选修 (xxxk)</option>
+                <option value="bxxk" ${g.course_type==='bxxk'?'selected':''}>通识必修 (bxxk)</option>
+                <option value="kzyxk" ${g.course_type==='kzyxk'?'selected':''}>培养方案内 (kzyxk)</option>
+              </select>
+            </div>
+            <div><label>类别关键词</label>
+              <input type="text" value="${g.category||''}" placeholder="如 人文、社科"
+                onchange="courseGroups[${i}].category=this.value">
+            </div>
+          </div>
+          <button class="btn btn-sm" style="margin-top:0.5rem" onclick="removeCourseGroup(${i})">删除</button>
+        </div>
+      `).join('');
+    }
+
+    async function fetchCategories() {
+      hideError();
+      const student_id = document.getElementById('student_id').value.trim();
+      const password = document.getElementById('password').value;
+      if (!student_id || !password) { showError('请先填写学号密码再查看类别'); return; }
+      const course_type = courseGroups[0]?.course_type || 'xxxk';
+      try {
+        const resp = await fetch('/api/categories', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ student_id, password, course_type }),
+        });
+        const data = await resp.json();
+        if (!data.ok) { showError(data.error || '获取类别失败'); return; }
+        const hint = document.getElementById('category_hint');
+        hint.style.display = 'block';
+        hint.textContent = data.categories.map(c =>
+          `${c.course_type_name} / ${c.category}（${c.course_count} 门）`
+        ).join('\n') || '未找到类别';
+      } catch (e) {
+        showError('网络错误: ' + e.message);
+      }
+    }
+
+    renderCourseGroups();
 
     function showWarning(msg) {
       const box = document.getElementById('warning-box');
@@ -358,14 +439,16 @@
 
       if (!resolutions) {
         if (!student_id || !password) { showError('请填写学号和密码'); return; }
-        if (!courses.length) { showError('请至少添加一门课程'); return; }
+        if (!courses.length && !courseGroups.length) {
+          showError('请至少添加一门固定课程或一个课程组'); return;
+        }
       }
 
       document.getElementById('loading').style.display = 'block';
       document.getElementById('results').style.display = 'none';
       document.getElementById('solve_btn').disabled = true;
 
-      const body = { courses, use_ratings, preferences: collectPreferences() };
+      const body = { courses, course_groups: courseGroups, use_ratings, preferences: collectPreferences() };
       if (resolutions) {
         body.resolutions = resolutions;
         body.session_id = pendingSessionId;

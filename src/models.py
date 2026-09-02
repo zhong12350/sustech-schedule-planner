@@ -58,6 +58,7 @@ class Section:
     section_name: str  # 教学班名称（通常含教师信息）
     section_id: str  # TIS 系统内部 ID
     course_type: str  # 选课类型代码 (bxxk, xxxk, ...)
+    category: str = ""  # TIS 课程子类，如通识选修的人文/社科
     time_slots: list[TimeSlot] = field(default_factory=list)
     teacher: str = ""  # 授课教师
     location: str = ""  # 上课地点
@@ -89,3 +90,17 @@ class Course:
 
     def __str__(self) -> str:
         return f"{self.name} ({len(self.sections)} 个教学班)"
+
+
+@dataclass
+class CourseGroup:
+    """课程组：从组内多门课中恰好选 pick 门（每门选一个教学班）。"""
+
+    name: str
+    pick: int = 1
+    courses: list[Course] = field(default_factory=list)
+    course_type: str = ""
+    category: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.name} (选 {self.pick} 门 / 共 {len(self.courses)} 门候选)"

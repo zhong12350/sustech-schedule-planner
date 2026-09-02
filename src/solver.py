@@ -1,26 +1,12 @@
-"""回溯求解器：枚举所有不冲突的课表组合"""
+"""回溯求解器：枚举所有不冲突的课表组合（含课程组 N 选 1）"""
 
 from __future__ import annotations
 
-from .models import Course, Section, TimeSlot
+from .models import Course, CourseGroup, Section, TimeSlot
 from .preferences import SchedulePreferences, schedule_violates_preferences
 
 
 def _has_conflict(time_slots: list[TimeSlot], occupied: set[tuple[int, int]]) -> bool:
-    """检查给定的时间段是否与已占用的时间槽冲突。
-
-    Parameters
-    ----------
-    time_slots : list[TimeSlot]
-        待检查的时间段列表
-    occupied : set[tuple[int, int]]
-        已占用的 (weekday, period) 集合
-
-    Returns
-    -------
-    bool
-        True 表示存在冲突
-    """
     for ts in time_slots:
         for period in range(ts.start_period, ts.end_period + 1):
             if (ts.weekday, period) in occupied:
@@ -29,7 +15,6 @@ def _has_conflict(time_slots: list[TimeSlot], occupied: set[tuple[int, int]]) ->
 
 
 def _occupy(time_slots: list[TimeSlot], occupied: set[tuple[int, int]]) -> list[tuple[int, int]]:
-    """将时间段加入占用集合，返回新增的槽位列表（用于回溯释放）。"""
     added: list[tuple[int, int]] = []
     for ts in time_slots:
         for period in range(ts.start_period, ts.end_period + 1):
@@ -40,101 +25,143 @@ def _occupy(time_slots: list[TimeSlot], occupied: set[tuple[int, int]]) -> list[
 
 
 def _release(added: list[tuple[int, int]], occupied: set[tuple[int, int]]) -> None:
-    """从占用集合中释放之前添加的时间槽。"""
     for key in added:
         occupied.discard(key)
+
+
+def _section_sort_key(section: Section) -> tuple:
+    return (
+        section.rating is None,
+        -(section.rating or 0.0),
+        -(section.review_count or 0),
+        section.section_name,
+    )
 
 
 def solve(
     courses: list[Course],
     max_results: int = 250,
     preferences: SchedulePreferences | None = None,
+    course_groups: list[CourseGroup] | None = None,
 ) -> list[list[Section]]:
     """求解所有不冲突的课表组合。
 
-    对每门课程选择一个教学班，使得所有选中的教学班之间没有时间冲突。
-
-    Parameters
-    ----------
-    courses : list[Course]
-        用户想选的课程列表，每门课包含多个可选教学班
-    preferences : SchedulePreferences | None
-        课表偏好硬约束；完整方案不满足时丢弃
-    max_results : int
-        最多返回多少个结果（防止组合爆炸），默认 100
-
-    Returns
-    -------
-    list[list[Section]]
-        每个元素是一种可行的选课方案，方案中包含每门课对应的教学班
+    固定课程：每门恰好选 1 个教学班。
+    课程组：每组恰好选 pick 门课，每门 1 个教学班。
     """
-    if not courses:
-        return []
+    course_groups = course_groups or []
 
-    # 过滤掉没有教学班的课程
     valid_courses = [c for c in courses if c.sections]
-    empty_courses = [c for c in courses if not c.sections]
-    if empty_courses:
-        for c in empty_courses:
+    for c in courses:
+        if not c.sections:
             print(f"  [!] 课程 \"{c.name}\" 没有可选的教学班，已跳过")
 
-    if not valid_courses:
+    valid_groups: list[CourseGroup] = []
+    for g in course_groups:
+        group_courses = [c for c in g.courses if c.sections]
+        if len(group_courses) < g.pick:
+            print(f"  [!] 课程组 \"{g.name}\" 剪枝后仅剩 {len(group_courses)} 门课，"
+                  f"无法满足选 {g.pick} 门")
+            continue
+        valid_groups.append(
+            CourseGroup(
+                name=g.name,
+                pick=g.pick,
+                courses=group_courses,
+                course_type=g.course_type,
+                category=g.category,
+            )
+        )
+
+    if not valid_courses and not valid_groups:
         return []
 
-    # 剪枝优化：教学班数量少的课程排在前面（约束传播思想）
     sorted_courses = sorted(valid_courses, key=lambda c: len(c.sections))
+    sorted_groups = sorted(
+        valid_groups,
+        key=lambda g: sum(len(c.sections) for c in g.courses),
+    )
 
     results: list[list[Section]] = []
     occupied: set[tuple[int, int]] = set()
     current_choice: list[Section] = []
 
-    def _backtrack(index: int) -> None:
-        # 找到足够多结果时停止
+    def _record_if_done() -> None:
+        if preferences and schedule_violates_preferences(current_choice, preferences):
+            return
+        results.append(current_choice.copy())
+
+    def _backtrack_fixed(index: int) -> None:
         if len(results) >= max_results:
             return
-
-        # 所有课程都已选择 -> 校验偏好后记录结果
         if index == len(sorted_courses):
-            if preferences and schedule_violates_preferences(current_choice, preferences):
-                return
-            results.append(current_choice.copy())
+            _backtrack_group(0)
             return
 
         course = sorted_courses[index]
-        # 优先尝试高评分教学班，更快找到优质方案
-        section_candidates = sorted(
-            course.sections,
-            key=lambda s: (
-                s.rating is None,
-                -(s.rating or 0.0),
-                -(s.review_count or 0),
-                s.section_name,
-            ),
-        )
-        for section in section_candidates:
-            # 跳过没有时间信息的教学班（无法判断冲突）
+        for section in sorted(course.sections, key=_section_sort_key):
             if not section.time_slots:
-                # 没有时间信息的教学班视为不冲突，直接加入
                 current_choice.append(section)
-                _backtrack(index + 1)
+                _backtrack_fixed(index + 1)
                 current_choice.pop()
                 continue
-
-            # 冲突检测
             if _has_conflict(section.time_slots, occupied):
                 continue
-
-            # 选择该教学班
             added = _occupy(section.time_slots, occupied)
             current_choice.append(section)
-
-            _backtrack(index + 1)
-
-            # 回溯：撤销选择
+            _backtrack_fixed(index + 1)
             current_choice.pop()
             _release(added, occupied)
 
-    _backtrack(0)
+    def _backtrack_group(group_index: int) -> None:
+        if len(results) >= max_results:
+            return
+        if group_index == len(sorted_groups):
+            _record_if_done()
+            return
+        group = sorted_groups[group_index]
+        _pick_from_group(group, 0, 0, group_index)
+
+    def _pick_from_group(
+        group: CourseGroup,
+        course_index: int,
+        picked: int,
+        group_index: int,
+    ) -> None:
+        if len(results) >= max_results:
+            return
+        if picked == group.pick:
+            _backtrack_group(group_index + 1)
+            return
+        if course_index >= len(group.courses):
+            return
+
+        # 跳过本门候选课
+        _pick_from_group(group, course_index + 1, picked, group_index)
+
+        if picked >= group.pick:
+            return
+
+        course = group.courses[course_index]
+        for section in sorted(course.sections, key=_section_sort_key):
+            if not section.time_slots:
+                current_choice.append(section)
+                _pick_from_group(group, course_index + 1, picked + 1, group_index)
+                current_choice.pop()
+                continue
+            if _has_conflict(section.time_slots, occupied):
+                continue
+            added = _occupy(section.time_slots, occupied)
+            current_choice.append(section)
+            _pick_from_group(group, course_index + 1, picked + 1, group_index)
+            current_choice.pop()
+            _release(added, occupied)
+
+    if sorted_courses:
+        _backtrack_fixed(0)
+    else:
+        _backtrack_group(0)
+
     return results
 
 
@@ -142,12 +169,18 @@ def print_solve_summary(
     courses: list[Course],
     results: list[list[Section]],
     max_results: int | None = None,
+    course_groups: list[CourseGroup] | None = None,
 ) -> None:
     """打印求解摘要信息。"""
+    course_groups = course_groups or []
     print(f"\n{'=' * 50}")
-    print(f"求解完成！")
-    print(f"  课程数: {len(courses)}")
+    print("求解完成！")
+    print(f"  固定课程: {len(courses)}")
+    if course_groups:
+        for g in course_groups:
+            print(f"  课程组: {g.name}（选 {g.pick} / {len(g.courses)} 候选）")
     total_sections = sum(len(c.sections) for c in courses)
+    total_sections += sum(len(c.sections) for g in course_groups for c in g.courses)
     print(f"  总教学班数: {total_sections}")
     print(f"  可行方案数: {len(results)}")
     if max_results and len(results) >= max_results:

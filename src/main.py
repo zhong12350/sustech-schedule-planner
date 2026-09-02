@@ -17,12 +17,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.auth import interactive_login, cas_login
 from src.scraper import get_semester_info, get_courses_for_selection, fetch_all_courses
-from src.course_selection import prompt_disambiguation
+from src.course_selection import prompt_disambiguation, SelectionResult
 from src.solver import solve, print_solve_summary
 from src.display import display_all_schedules, display_schedule
 from src.ratings import enrich_courses_with_ratings, rank_schedules, score_schedule
 from src.filters import diagnose_no_solution, filter_courses_for_solve, suggest_fixes, format_suggestions
 from src.preferences import SchedulePreferences, filter_sections_for_preferences
+from src.course_groups import (
+    parse_group_configs,
+    expand_course_groups,
+    filter_groups_for_solve,
+)
 from src.selector import select_schedule
 
 console = Console()
@@ -71,13 +76,18 @@ def load_config(config_path: str = "config.yaml") -> dict:
     with open(full_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    if not config or "courses" not in config:
-        console.print("[red]配置文件格式错误：缺少 courses 字段[/red]")
+    if not config:
+        console.print("[red]配置文件为空[/red]")
         sys.exit(1)
 
-    courses = config["courses"]
-    if not isinstance(courses, list) or len(courses) == 0:
-        console.print("[red]配置文件中 courses 列表为空[/red]")
+    courses = config.get("courses") or []
+    groups = config.get("course_groups") or []
+    if not courses and not groups:
+        console.print("[red]配置需至少包含 courses 或 course_groups 之一[/red]")
+        sys.exit(1)
+
+    if not isinstance(courses, list):
+        console.print("[red]courses 必须是列表[/red]")
         sys.exit(1)
 
     config["courses"] = [str(c).strip() for c in courses if c]
@@ -92,9 +102,16 @@ def main() -> None:
     console.print("[bold]步骤 1/4: 读取课程配置[/bold]")
     config = load_config()
     wanted_courses = config["courses"]
-    console.print(f"[green]已读取 {len(wanted_courses)} 门想选的课程:[/green]")
-    for i, name in enumerate(wanted_courses, 1):
-        console.print(f"  {i}. {name}")
+    group_configs = parse_group_configs(config.get("course_groups"))
+    if wanted_courses:
+        console.print(f"[green]已读取 {len(wanted_courses)} 门固定课程:[/green]")
+        for i, name in enumerate(wanted_courses, 1):
+            console.print(f"  {i}. {name}")
+    if group_configs:
+        console.print(f"[green]已读取 {len(group_configs)} 个课程组 (N 选 1):[/green]")
+        for g in group_configs:
+            label = g.category or g.course_type or "candidates"
+            console.print(f"  • {g.name}  选 {g.pick} 门  ({label})")
     console.print()
 
     # 2. 登录 TIS
@@ -136,12 +153,22 @@ def main() -> None:
 
     try:
         all_courses = fetch_all_courses(headers, semester_info)
+
+        group_expand = expand_course_groups(group_configs, all_courses)
+        for msg in group_expand.warnings:
+            console.print(f"  [*] {msg}")
+        for msg in group_expand.errors:
+            console.print(f"[red]  [!] {msg}[/red]")
+        if group_expand.errors and not wanted_courses:
+            sys.exit(1)
+
         selection = get_courses_for_selection(
             headers,
             semester_info,
             wanted_courses,
             all_courses=all_courses,
-        )
+        ) if wanted_courses else SelectionResult()
+        course_groups = group_expand.groups
         while selection.ambiguous:
             resolutions = prompt_disambiguation(selection.ambiguous)
             selection = get_courses_for_selection(
@@ -156,29 +183,41 @@ def main() -> None:
         console.print(f"[red]获取课程数据失败: {e}[/red]")
         sys.exit(1)
 
+    if not courses and not course_groups:
+        console.print("[red]未能获取到任何课程或课程组，请检查配置[/red]")
+        sys.exit(1)
+
     if selection.not_found:
         console.print(
             f"[yellow]警告: {len(selection.not_found)} 门课未找到，将不参与求解[/yellow]"
         )
 
-    if not courses:
-        console.print("[red]未能获取到任何课程信息，请检查课程名是否正确[/red]")
-        sys.exit(1)
-
     # 展示获取到的课程信息
-    console.print("\n[bold]已获取的课程信息:[/bold]")
-    for course in courses:
-        console.print(f"\n  [bright_cyan]{course.name}[/bright_cyan] ({len(course.sections)} 个教学班)")
-        for sec in course.sections:
-            slots_str = ", ".join(str(ts) for ts in sec.time_slots) or "时间未知"
-            console.print(f"    - {sec.section_name}  [dim]{slots_str}[/dim]")
+    if courses:
+        console.print("\n[bold]已获取的固定课程:[/bold]")
+        for course in courses:
+            console.print(f"\n  [bright_cyan]{course.name}[/bright_cyan] ({len(course.sections)} 个教学班)")
+            for sec in course.sections:
+                slots_str = ", ".join(str(ts) for ts in sec.time_slots) or "时间未知"
+                console.print(f"    - {sec.section_name}  [dim]{slots_str}[/dim]")
+
+    if course_groups:
+        console.print("\n[bold]课程组候选:[/bold]")
+        for group in course_groups:
+            console.print(
+                f"  [bright_cyan]{group.name}[/bright_cyan]: "
+                f"选 {group.pick} 门 / {len(group.courses)} 门候选"
+            )
 
     # 4. 获取 NCES 评分
     use_ratings = config.get("use_ratings", True)
     if use_ratings:
         enrich_courses_with_ratings(courses)
+        group_flat = [c for g in course_groups for c in g.courses]
+        if group_flat:
+            enrich_courses_with_ratings(group_flat)
 
-    # 4.5 剪枝：低分教学班 / 每课保留 top-N
+    # 4.5 剪枝
     min_rating = config.get("min_rating")
     if use_ratings and min_rating is None:
         min_rating = 5.0
@@ -192,47 +231,52 @@ def main() -> None:
         max_sections_per_course=max_sections_per_course,
         keep_unrated=True,
     )
-    if filter_stats.removed_low_rating or filter_stats.removed_section_cap:
-        console.print("\n[bold]剪枝后教学班数量:[/bold]")
-        if filter_stats.removed_low_rating:
-            console.print(
-                f"  [dim]剔除 NCES 评分 < {min_rating} 的教学班: "
-                f"{filter_stats.removed_low_rating} 个[/dim]"
-            )
-        if filter_stats.removed_section_cap:
-            console.print(
-                f"  [dim]每课仅保留评分最高的 {max_sections_per_course} 个班: "
-                f"再剔除 {filter_stats.removed_section_cap} 个[/dim]"
-            )
-        for course in solve_courses:
-            console.print(f"  {course.name}: {len(course.sections)} 个班")
+    solve_groups = filter_groups_for_solve(
+        course_groups,
+        min_rating=min_rating if use_ratings else None,
+        max_sections_per_course=max_sections_per_course,
+        keep_unrated=True,
+    )
 
     if preferences.is_active():
         solve_courses, pref_stats = filter_sections_for_preferences(solve_courses, preferences)
+        pref_groups: list = []
+        for group in solve_groups:
+            filtered_courses, _ = filter_sections_for_preferences(group.courses, preferences)
+            if filtered_courses:
+                from src.models import CourseGroup
+                pref_groups.append(
+                    CourseGroup(
+                        name=group.name,
+                        pick=group.pick,
+                        courses=filtered_courses,
+                        course_type=group.course_type,
+                        category=group.category,
+                    )
+                )
+        solve_groups = pref_groups
         console.print("[bold]已启用课表偏好:[/bold]")
         for line in preferences.summary_lines():
             console.print(f"  • {line}")
-        if pref_stats.removed_early_morning:
-            console.print(
-                f"  [dim]剔除早八教学班: {pref_stats.removed_early_morning} 个[/dim]"
-            )
     else:
         pref_stats = None
 
-    if filter_stats.removed_empty_courses:
-        console.print(
-            f"[yellow][!] {filter_stats.removed_empty_courses} 门课在剪枝后无可选教学班[/yellow]"
-        )
-
-    if not solve_courses:
-        console.print("[red]剪枝后没有可选教学班，请降低 min_rating 或增大 max_sections_per_course[/red]")
+    if not solve_courses and not solve_groups:
+        console.print("[red]剪枝后没有可选教学班/课程组，请降低 min_rating 或检查配置[/red]")
         sys.exit(1)
 
     # 5. 求解
-    console.print(f"\n[bold]步骤 {'5' if use_ratings else '4'}/{'5' if use_ratings else '4'}: 求解无冲突课表[/bold]")
+    console.print(f"\n[bold]步骤 5/5: 求解无冲突课表[/bold]")
     console.print(f"[dim]最多保留 {max_results} 种方案（按评分与偏好优先搜索）[/dim]")
-    results = solve(solve_courses, max_results=max_results, preferences=preferences)
-    print_solve_summary(solve_courses, results, max_results=max_results)
+    results = solve(
+        solve_courses,
+        max_results=max_results,
+        preferences=preferences,
+        course_groups=solve_groups,
+    )
+    print_solve_summary(
+        solve_courses, results, max_results=max_results, course_groups=solve_groups
+    )
 
     if not results:
         hints = diagnose_no_solution(solve_courses)

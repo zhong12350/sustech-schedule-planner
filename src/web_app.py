@@ -17,7 +17,15 @@ from src.solver import solve
 from src.ratings import enrich_courses_with_ratings, rank_schedules, score_schedule
 from src.filters import filter_courses_for_solve, diagnose_no_solution, suggest_fixes, format_suggestions
 from src.preferences import SchedulePreferences, filter_sections_for_preferences
+from src.course_groups import (
+    parse_group_configs,
+    expand_course_groups,
+    filter_groups_for_solve,
+    list_categories,
+)
+from src.models import CourseGroup
 from src.course_match import CourseMatchResult
+from src.course_selection import SelectionResult
 
 app = Flask(
     __name__,
@@ -85,6 +93,7 @@ def api_solve():
     student_id = (data.get("student_id") or "").strip()
     password = data.get("password") or ""
     course_names = data.get("courses") or []
+    course_groups_raw = data.get("course_groups") or []
     use_ratings = data.get("use_ratings", True)
     resolutions = data.get("resolutions") or {}
     session_id = data.get("session_id") or ""
@@ -94,12 +103,12 @@ def api_solve():
     max_results = data.get("max_results", 100)
     preferences = SchedulePreferences.from_dict(data.get("preferences"))
 
-    if not course_names:
-        return jsonify({"ok": False, "error": "请至少添加一门课程"}), 400
+    group_configs = parse_group_configs(course_groups_raw)
+
+    if not course_names and not group_configs:
+        return jsonify({"ok": False, "error": "请至少添加一门固定课程或一个课程组"}), 400
 
     course_names = [c.strip() for c in course_names if c.strip()]
-    if not course_names:
-        return jsonify({"ok": False, "error": "请至少添加一门课程"}), 400
 
     # 复用已有会话（歧义消解后的第二次请求）
     cached = _sessions.get(session_id) if session_id else None
@@ -130,13 +139,21 @@ def api_solve():
             return jsonify({"ok": False, "error": f"获取课程数据失败: {e}"}), 500
 
     try:
+        group_expand = expand_course_groups(group_configs, all_courses)
+        if group_expand.errors:
+            return jsonify({
+                "ok": False,
+                "error": "；".join(group_expand.errors),
+            }), 400
+
         selection = get_courses_for_selection(
             headers,
             semester_info,
             course_names,
             resolutions=resolutions,
             all_courses=all_courses,
-        )
+        ) if course_names else SelectionResult()
+        course_groups = group_expand.groups
     except Exception as e:
         return jsonify({"ok": False, "error": f"课程匹配失败: {e}"}), 500
 
@@ -160,18 +177,27 @@ def api_solve():
 
     courses = selection.courses
 
-    if not courses:
+    if not courses and not course_groups:
         return jsonify({
             "ok": False,
-            "error": "未找到任何课程，请检查课程名称是否正确",
+            "error": "未找到任何课程或课程组，请检查配置",
             "not_found": selection.not_found,
         }), 404
 
     if use_ratings:
         enrich_courses_with_ratings(courses, verbose=False)
+        group_flat = [c for g in course_groups for c in g.courses]
+        if group_flat:
+            enrich_courses_with_ratings(group_flat, verbose=False)
 
     solve_courses, filter_stats = filter_courses_for_solve(
         courses,
+        min_rating=min_rating if use_ratings else None,
+        max_sections_per_course=max_sections_per_course,
+        keep_unrated=True,
+    )
+    solve_groups = filter_groups_for_solve(
+        course_groups,
         min_rating=min_rating if use_ratings else None,
         max_sections_per_course=max_sections_per_course,
         keep_unrated=True,
@@ -180,15 +206,34 @@ def api_solve():
     pref_stats = None
     if preferences.is_active():
         solve_courses, pref_stats = filter_sections_for_preferences(solve_courses, preferences)
+        pref_groups: list[CourseGroup] = []
+        for group in solve_groups:
+            filtered_courses, _ = filter_sections_for_preferences(group.courses, preferences)
+            if filtered_courses:
+                pref_groups.append(
+                    CourseGroup(
+                        name=group.name,
+                        pick=group.pick,
+                        courses=filtered_courses,
+                        course_type=group.course_type,
+                        category=group.category,
+                    )
+                )
+        solve_groups = pref_groups
 
-    if not solve_courses:
+    if not solve_courses and not solve_groups:
         return jsonify({
             "ok": False,
             "error": "剪枝后没有可选教学班，请降低评分要求或减少课程",
             "not_found": selection.not_found,
         }), 400
 
-    results = solve(solve_courses, max_results=max_results, preferences=preferences)
+    results = solve(
+        solve_courses,
+        max_results=max_results,
+        preferences=preferences,
+        course_groups=solve_groups,
+    )
 
     if not results:
         hints = diagnose_no_solution(solve_courses)
@@ -241,6 +286,8 @@ def api_solve():
     warnings: list[str] = []
     if selection.not_found:
         warnings.append(f"以下课程未找到：{', '.join(selection.not_found)}")
+    if group_expand.warnings:
+        warnings.extend(group_expand.warnings)
     if filter_stats.removed_empty_courses:
         warnings.append(f"{filter_stats.removed_empty_courses} 门课在剪枝后无可选教学班")
     if pref_stats and pref_stats.removed_early_morning:
@@ -258,6 +305,48 @@ def api_solve():
         "requested_count": len(course_names),
         "not_found": selection.not_found,
         "warnings": warnings,
+    })
+
+
+@app.route("/api/categories", methods=["POST"])
+def api_categories():
+    """登录后列出 TIS 课程类别（供配置 course_groups）。"""
+    data = request.get_json() or {}
+    student_id = (data.get("student_id") or "").strip()
+    password = data.get("password") or ""
+    course_type = (data.get("course_type") or "").strip() or None
+    session_id = data.get("session_id") or ""
+
+    cached = _sessions.get(session_id) if session_id else None
+    if cached and cached.get("all_courses"):
+        all_courses = cached["all_courses"]
+        semester_label = cached.get("semester_label", "")
+    else:
+        if not student_id or not password:
+            return jsonify({"ok": False, "error": "请填写学号和密码"}), 400
+        try:
+            headers = cas_login(student_id, password)
+            semester_info = get_semester_info(headers)
+            semester_label = (
+                f"{semester_info.get('p_xn', '?')} 第{semester_info.get('p_xq', '?')}学期"
+            )
+            all_courses = fetch_all_courses(headers, semester_info)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+        sid = secrets.token_hex(16)
+        _sessions[sid] = {
+            "all_courses": all_courses,
+            "semester_label": semester_label,
+        }
+        session_id = sid
+
+    cats = list_categories(all_courses, course_type=course_type)
+    return jsonify({
+        "ok": True,
+        "session_id": session_id,
+        "semester": semester_label,
+        "categories": cats,
     })
 
 
