@@ -39,11 +39,12 @@ class CourseMatchResult:
     """单门用户输入课程的匹配结果。"""
 
     query: str
-    status: str  # "exact" | "matched" | "ambiguous" | "not_found"
+    status: str  # "exact" | "matched" | "ambiguous" | "not_found" | "alias"
     keys: list[str] = field(default_factory=list)
     score: float = 0.0
     options: list[MatchOption] = field(default_factory=list)
     near_misses: list[tuple[str, float]] = field(default_factory=list)
+    alias_target: str = ""  # 别名表解析后的正式课名
 
 
 def normalize_course_name(name: str) -> str:
@@ -260,46 +261,72 @@ def resolve_course_match(
     if not query:
         return CourseMatchResult(query=query, status="not_found")
 
+    original_query = query
+    from .aliases import apply_alias
+
+    search_query, alias_target, alias_keys = apply_alias(query, available_keys)
+    if alias_keys:
+        return CourseMatchResult(
+            query=original_query,
+            status="alias",
+            keys=alias_keys,
+            score=1.0,
+            alias_target=alias_target or search_query,
+        )
+    if alias_target:
+        query = search_query
+
     # 精确 key 匹配
     if query in available_keys:
-        return CourseMatchResult(
-            query=query,
+        result = CourseMatchResult(
+            query=original_query,
             status="exact",
             keys=[query],
             score=1.0,
         )
+        if alias_target:
+            result.alias_target = alias_target
+            result.status = "alias"
+        return result
 
     scored = find_matching_course_keys(query, available_keys, threshold)
     if not scored:
         near = find_matching_course_keys(query, available_keys, threshold=0.5)
         return CourseMatchResult(
-            query=query,
+            query=original_query,
             status="not_found",
             near_misses=near[:5],
+            alias_target=alias_target or "",
         )
 
     scored_map = {key: score for key, score in scored}
     groups = group_keys_by_identity([key for key, _ in scored], query=query)
 
+    def _with_alias_meta(result: CourseMatchResult) -> CourseMatchResult:
+        result.query = original_query
+        if alias_target:
+            result.alias_target = alias_target
+        return result
+
     # 用户已选择
     if chosen_identity:
         if chosen_identity in groups:
             keys = groups[chosen_identity]
-            return CourseMatchResult(
-                query=query,
+            return _with_alias_meta(CourseMatchResult(
+                query=original_query,
                 status="matched",
                 keys=keys,
                 score=max(scored_map[k] for k in keys),
-            )
+            ))
         # 按规范化名查找
         for identity, keys in groups.items():
             if identity == chosen_identity or normalize_course_name(chosen_identity) == identity:
-                return CourseMatchResult(
-                    query=query,
+                return _with_alias_meta(CourseMatchResult(
+                    query=original_query,
                     status="matched",
                     keys=keys,
                     score=max(scored_map[k] for k in keys),
-                )
+                ))
 
     options = _build_options(groups, scored_map, section_meta)
 
@@ -307,30 +334,30 @@ def resolve_course_match(
     q_norm = normalize_course_name(query)
     if q_norm in groups and len(groups) == 1:
         keys = groups[q_norm]
-        return CourseMatchResult(
-            query=query,
+        return _with_alias_meta(CourseMatchResult(
+            query=original_query,
             status="matched",
             keys=keys,
             score=max(scored_map[k] for k in keys),
-        )
+        ))
 
     # 只有一个候选身份
     if len(groups) == 1:
         keys = next(iter(groups.values()))
-        return CourseMatchResult(
-            query=query,
+        return _with_alias_meta(CourseMatchResult(
+            query=original_query,
             status="matched",
             keys=keys,
             score=options[0].score,
-        )
+        ))
 
     # 多个候选身份 -> 歧义
-    return CourseMatchResult(
-        query=query,
+    return _with_alias_meta(CourseMatchResult(
+        query=original_query,
         status="ambiguous",
         options=options,
         score=options[0].score,
-    )
+    ))
 
 
 def pick_best_match_group(
@@ -344,7 +371,7 @@ def pick_best_match_group(
     推荐使用 resolve_course_match 获取完整歧义信息。
     """
     result = resolve_course_match(query, available_keys, threshold=threshold)
-    if result.status in ("exact", "matched"):
+    if result.status in ("exact", "matched", "alias"):
         return result.keys, result.score
     if result.status == "ambiguous" and result.options:
         return result.options[0].keys, result.options[0].score

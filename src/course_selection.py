@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from .course_match import CourseMatchResult, resolve_course_match
 from .models import Course, Section
+from .aliases import log_match_miss
 
 
 @dataclass
@@ -23,6 +24,7 @@ def match_courses_from_catalog(
     all_courses: dict[str, list[Section]],
     *,
     resolutions: dict[str, str] | None = None,
+    semester_label: str = "",
 ) -> SelectionResult:
     """从已拉取的 TIS 课程目录中匹配用户输入。
 
@@ -57,18 +59,28 @@ def match_courses_from_catalog(
 
         if match.status == "not_found":
             result.not_found.append(name)
+            log_match_miss(name, match.near_misses, semester=semester_label)
             if match.near_misses:
                 result.match_log.append(f"\"{name}\" 未找到，最接近的候选：")
                 for key, score in match.near_misses[:3]:
                     result.match_log.append(f"  - {key}  (相似度 {score:.0%})")
+                result.match_log.append(
+                    "  提示: 可在 tis_course_aliases.yaml 添加别名，"
+                    "或运行 scripts/export_tis_catalog.py 查正式课名"
+                )
             continue
 
-        # exact 或 matched
+        # exact / matched / alias
         all_sections: list[Section] = []
         for key in match.keys:
             all_sections.extend(all_courses[key])
 
-        if match.status == "exact":
+        if match.status == "alias":
+            result.match_log.append(
+                f"别名匹配: \"{name}\" -> \"{match.alias_target}\" "
+                f"({len(all_sections)} 个教学班)"
+            )
+        elif match.status == "exact":
             result.match_log.append(f"精确匹配: \"{name}\" ({len(all_sections)} 个教学班)")
         else:
             identities = {s.course_name for s in all_sections[:1]}

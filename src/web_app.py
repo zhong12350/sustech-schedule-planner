@@ -15,7 +15,8 @@ from src.auth import cas_login
 from src.scraper import get_semester_info, get_courses_for_selection, fetch_all_courses
 from src.solver import solve
 from src.ratings import enrich_courses_with_ratings, rank_schedules, score_schedule
-from src.filters import filter_courses_for_solve, diagnose_no_solution
+from src.filters import filter_courses_for_solve, diagnose_no_solution, suggest_fixes, format_suggestions
+from src.preferences import SchedulePreferences, filter_sections_for_preferences
 from src.course_match import CourseMatchResult
 
 app = Flask(
@@ -45,6 +46,7 @@ def _schedule_to_dict(schedule, score, rated, total) -> dict:
             "review_count": sec.review_count,
             "grading_score": sec.grading_score,
             "gain_score": sec.gain_score,
+            "location": sec.location or "",
         })
     return {
         "courses": courses,
@@ -90,6 +92,7 @@ def api_solve():
     min_rating = data.get("min_rating", 5.0)
     max_sections_per_course = data.get("max_sections_per_course", 12)
     max_results = data.get("max_results", 100)
+    preferences = SchedulePreferences.from_dict(data.get("preferences"))
 
     if not course_names:
         return jsonify({"ok": False, "error": "请至少添加一门课程"}), 400
@@ -174,6 +177,10 @@ def api_solve():
         keep_unrated=True,
     )
 
+    pref_stats = None
+    if preferences.is_active():
+        solve_courses, pref_stats = filter_sections_for_preferences(solve_courses, preferences)
+
     if not solve_courses:
         return jsonify({
             "ok": False,
@@ -181,22 +188,39 @@ def api_solve():
             "not_found": selection.not_found,
         }), 400
 
-    results = solve(solve_courses, max_results=max_results)
+    results = solve(solve_courses, max_results=max_results, preferences=preferences)
 
     if not results:
         hints = diagnose_no_solution(solve_courses)
+        suggestions = suggest_fixes(
+            solve_courses,
+            max_results=max_results,
+            preferences=preferences,
+            all_courses=all_courses,
+        )
+        suggestion_msgs = format_suggestions(suggestions)
         return jsonify({
             "ok": True,
             "semester": semester_label,
             "total": 0,
             "schedules": [],
             "not_found": selection.not_found,
-            "warnings": hints,
-            "message": "没有找到无冲突的课表方案，请减少课程后重试",
+            "warnings": hints + suggestion_msgs,
+            "suggestions": [
+                {
+                    "action": s.action,
+                    "course": s.course_name,
+                    "alternative": s.alternative,
+                    "recovered": s.recovered_count,
+                    "message": s.message,
+                }
+                for s in suggestions
+            ],
+            "message": "没有找到满足条件的课表方案，请查看下方建议",
         })
 
     if use_ratings:
-        ranked = rank_schedules(results)
+        ranked = rank_schedules(results, preferences=preferences)
         schedules = [
             _schedule_to_dict(sch, total, rated, count)
             for sch, total, rated, count in ranked
@@ -219,6 +243,10 @@ def api_solve():
         warnings.append(f"以下课程未找到：{', '.join(selection.not_found)}")
     if filter_stats.removed_empty_courses:
         warnings.append(f"{filter_stats.removed_empty_courses} 门课在剪枝后无可选教学班")
+    if pref_stats and pref_stats.removed_early_morning:
+        warnings.append(f"已剔除 {pref_stats.removed_early_morning} 个早八教学班")
+    if preferences.is_active():
+        warnings.append("已启用偏好：" + "；".join(preferences.summary_lines()))
 
     return jsonify({
         "ok": True,

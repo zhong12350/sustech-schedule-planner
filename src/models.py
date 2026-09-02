@@ -60,6 +60,7 @@ class Section:
     course_type: str  # 选课类型代码 (bxxk, xxxk, ...)
     time_slots: list[TimeSlot] = field(default_factory=list)
     teacher: str = ""  # 授课教师
+    location: str = ""  # 上课地点
     rating: float | None = None  # NCES 综合评分 (0-10)
     review_count: int = 0  # NCES 评价人数
     rating_source: str = ""  # 评分来源，如 "NCES"

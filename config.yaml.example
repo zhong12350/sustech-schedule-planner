@@ -26,3 +26,10 @@ use_ratings: true
 min_rating: 5.0              # NCES 低于此分的教学班直接排除；无评分的班保留
 max_sections_per_course: 12  # 每门课最多保留多少个教学班（按评分从高到低）
 max_results: 100             # 最多输出多少种无冲突方案
+
+# 课表偏好（可选，默认全部关闭）
+preferences:
+  no_early_morning: false       # 不上早八（第 1 节）
+  max_consecutive_periods: 0    # 同一天连堂上限；0 表示不限制
+  min_free_days: 0              # 每周至少几天没课；0 表示不限制
+  prefer_nearby_locations: false  # 排序时优先同一天地点相近

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .models import Course, Section, TimeSlot
+from .preferences import SchedulePreferences, schedule_violates_preferences
 
 
 def _has_conflict(time_slots: list[TimeSlot], occupied: set[tuple[int, int]]) -> bool:
@@ -47,6 +48,7 @@ def _release(added: list[tuple[int, int]], occupied: set[tuple[int, int]]) -> No
 def solve(
     courses: list[Course],
     max_results: int = 250,
+    preferences: SchedulePreferences | None = None,
 ) -> list[list[Section]]:
     """求解所有不冲突的课表组合。
 
@@ -56,6 +58,8 @@ def solve(
     ----------
     courses : list[Course]
         用户想选的课程列表，每门课包含多个可选教学班
+    preferences : SchedulePreferences | None
+        课表偏好硬约束；完整方案不满足时丢弃
     max_results : int
         最多返回多少个结果（防止组合爆炸），默认 100
 
@@ -89,8 +93,10 @@ def solve(
         if len(results) >= max_results:
             return
 
-        # 所有课程都已选择 -> 记录结果
+        # 所有课程都已选择 -> 校验偏好后记录结果
         if index == len(sorted_courses):
+            if preferences and schedule_violates_preferences(current_choice, preferences):
+                return
             results.append(current_choice.copy())
             return
 

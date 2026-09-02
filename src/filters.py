@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .course_match import group_keys_by_identity, find_matching_course_keys
 from .models import Course, Section
+from .preferences import SchedulePreferences, filter_sections_for_preferences
+from .solver import solve
 
 
 @dataclass
@@ -12,6 +15,17 @@ class FilterStats:
     removed_low_rating: int = 0
     removed_section_cap: int = 0
     removed_empty_courses: int = 0
+
+
+@dataclass
+class FixSuggestion:
+    """无解时可尝试的修复建议。"""
+
+    action: str  # drop | switch | relax_preferences
+    course_name: str
+    recovered_count: int
+    message: str
+    alternative: str = ""
 
 
 def sections_conflict(a: Section, b: Section) -> bool:
@@ -99,3 +113,142 @@ def diagnose_no_solution(courses: list[Course]) -> list[str]:
         hints.append(f"以下课程仅有 1 个教学班，无法通过换班消冲突：{names}")
 
     return hints
+
+
+def _count_solutions(
+    courses: list[Course],
+    *,
+    max_results: int,
+    preferences: SchedulePreferences | None,
+) -> int:
+    if len(courses) < 1:
+        return 0
+    working = list(courses)
+    if preferences and preferences.is_active():
+        working, _ = filter_sections_for_preferences(working, preferences)
+        if not working:
+            return 0
+    results = solve(working, max_results=max_results, preferences=preferences)
+    return len(results)
+
+
+def _course_from_alternative_keys(
+    query: str,
+    keys: list[str],
+    all_courses: dict[str, list[Section]],
+) -> Course | None:
+    sections: list[Section] = []
+    for key in keys:
+        sections.extend(all_courses.get(key, []))
+    if not sections:
+        return None
+    return Course(name=query, sections=sections)
+
+
+def suggest_fixes(
+    courses: list[Course],
+    *,
+    max_results: int = 100,
+    preferences: SchedulePreferences | None = None,
+    all_courses: dict[str, list[Section]] | None = None,
+) -> list[FixSuggestion]:
+    """无解时给出可恢复方案数的修复建议。"""
+    if not courses:
+        return []
+
+    prefs = preferences or SchedulePreferences()
+    baseline = _count_solutions(courses, max_results=max_results, preferences=prefs)
+    if baseline > 0:
+        return []
+
+    suggestions: list[FixSuggestion] = []
+
+    # 偏好过严：无偏好时其实有解
+    if prefs.is_active():
+        without_prefs = _count_solutions(
+            courses, max_results=max_results, preferences=SchedulePreferences()
+        )
+        if without_prefs > 0:
+            pref_desc = "、".join(prefs.summary_lines()) or "当前偏好"
+            suggestions.append(
+                FixSuggestion(
+                    action="relax_preferences",
+                    course_name="",
+                    recovered_count=without_prefs,
+                    message=(
+                        f"关闭或放宽偏好（{pref_desc}）"
+                        f"可恢复约 {without_prefs} 个方案"
+                    ),
+                )
+            )
+
+    # 移除单门课
+    drop_candidates: list[FixSuggestion] = []
+    for i, course in enumerate(courses):
+        reduced = courses[:i] + courses[i + 1 :]
+        if not reduced:
+            continue
+        count = _count_solutions(reduced, max_results=max_results, preferences=prefs)
+        if count > 0:
+            drop_candidates.append(
+                FixSuggestion(
+                    action="drop",
+                    course_name=course.name,
+                    recovered_count=count,
+                    message=f"移除「{course.name}」可恢复约 {count} 个方案",
+                )
+            )
+    drop_candidates.sort(key=lambda s: (-s.recovered_count, s.course_name))
+    suggestions.extend(drop_candidates[:5])
+
+    # 切换歧义身份（需完整 TIS 目录）
+    if all_courses:
+        all_keys = list(all_courses.keys())
+        switch_candidates: list[FixSuggestion] = []
+        for i, course in enumerate(courses):
+            scored = find_matching_course_keys(course.name, all_keys)
+            if not scored:
+                continue
+            groups = group_keys_by_identity([k for k, _ in scored], query=course.name)
+            if len(groups) < 2:
+                continue
+
+            current_identities = {s.course_name for s in course.sections}
+            for identity, keys in groups.items():
+                if identity in current_identities:
+                    continue
+                alt_course = _course_from_alternative_keys(course.name, keys, all_courses)
+                if alt_course is None:
+                    continue
+                trial = list(courses)
+                trial[i] = alt_course
+                count = _count_solutions(trial, max_results=max_results, preferences=prefs)
+                if count > 0:
+                    switch_candidates.append(
+                        FixSuggestion(
+                            action="switch",
+                            course_name=course.name,
+                            alternative=identity,
+                            recovered_count=count,
+                            message=(
+                                f"将「{course.name}」换为「{identity}」"
+                                f"可恢复约 {count} 个方案"
+                            ),
+                        )
+                    )
+        switch_candidates.sort(key=lambda s: (-s.recovered_count, s.course_name))
+        suggestions.extend(switch_candidates[:5])
+
+    # 去重：同一 message 只保留一条
+    seen: set[str] = set()
+    unique: list[FixSuggestion] = []
+    for s in suggestions:
+        if s.message in seen:
+            continue
+        seen.add(s.message)
+        unique.append(s)
+    return unique
+
+
+def format_suggestions(suggestions: list[FixSuggestion]) -> list[str]:
+    return [s.message for s in suggestions]

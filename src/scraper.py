@@ -11,6 +11,7 @@ import requests
 from urllib3.exceptions import InsecureRequestWarning
 
 from .models import Course, Section, TimeSlot, WEEKDAY_MAP
+from .preferences import parse_location_from_text
 from .course_match import find_matching_course_keys
 from .course_selection import SelectionResult, match_courses_from_catalog, prompt_disambiguation
 
@@ -32,6 +33,37 @@ COURSE_TYPES: dict[str, str] = {
 
 # 时间正则：匹配 "星期一第1-2节" 这种格式
 TIME_PATTERN = re.compile(r"星期([一二三四五六日])第(\d+)-(\d+)节")
+
+LOCATION_FIELDS = ("jxdd", "skdd", "cdmc", "jxbdd", "jsmc")
+
+
+def _extract_time_and_location(item: dict) -> tuple[str, str]:
+    """从 TIS 课程条目提取上课时间与地点。"""
+    time_str = ""
+    location = ""
+    for field in LOCATION_FIELDS:
+        val = item.get(field)
+        if val:
+            location = str(val).strip()
+            break
+
+    for time_field in ["sksj", "sksjms", "sksjStr", "sksjdd"]:
+        if item.get(time_field):
+            time_str = str(item[time_field])
+            if not location and time_field == "sksjdd":
+                location = parse_location_from_text(time_str)
+            break
+
+    if not time_str:
+        item_str = json.dumps(item, ensure_ascii=False)
+        if TIME_PATTERN.search(item_str):
+            time_str = item_str
+            if not location:
+                location = parse_location_from_text(item_str)
+
+    if not location:
+        location = parse_location_from_text(time_str)
+    return time_str, location
 
 
 def fetch_selected_courses(
@@ -83,6 +115,7 @@ def fetch_selected_courses(
                 if TIME_PATTERN.search(item_str):
                     time_str = item_str
 
+            _, location = _extract_time_and_location(item)
             time_slots = parse_time_slots(time_str)
             sec = Section(
                 course_name=course_name,
@@ -91,6 +124,7 @@ def fetch_selected_courses(
                 course_type=item.get("p_xkfsdm", ""),
                 time_slots=time_slots,
                 teacher=teacher,
+                location=location,
             )
             selected.append(sec)
 
@@ -222,19 +256,7 @@ def fetch_all_courses(
                 section_id = item.get("id", "")
                 teacher = item.get("dgjsmc", "") or ""
 
-                # 尝试从多个可能的字段中提取时间信息
-                time_str = ""
-                # 常见的时间字段名
-                for time_field in ["sksj", "sksjms", "sksjStr", "sksjdd"]:
-                    if item.get(time_field):
-                        time_str = str(item[time_field])
-                        break
-
-                # 如果上面的字段都没有，尝试从整个 item 的字符串表示中提取
-                if not time_str:
-                    item_str = json.dumps(item, ensure_ascii=False)
-                    if TIME_PATTERN.search(item_str):
-                        time_str = item_str
+                time_str, location = _extract_time_and_location(item)
 
                 time_slots = parse_time_slots(time_str)
 
@@ -250,6 +272,7 @@ def fetch_all_courses(
                     course_type=c_type,
                     time_slots=time_slots,
                     teacher=teacher,
+                    location=location,
                 )
                 course_map[course_name].append(section)
 
@@ -325,6 +348,9 @@ def get_courses_for_selection(
         wanted_course_names,
         all_courses,
         resolutions=resolutions,
+        semester_label=(
+            f"{semester_info.get('p_xn', '?')} 第{semester_info.get('p_xq', '?')}学期"
+        ),
     )
 
     for line in selection.match_log:

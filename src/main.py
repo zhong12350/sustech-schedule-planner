@@ -21,7 +21,8 @@ from src.course_selection import prompt_disambiguation
 from src.solver import solve, print_solve_summary
 from src.display import display_all_schedules, display_schedule
 from src.ratings import enrich_courses_with_ratings, rank_schedules, score_schedule
-from src.filters import diagnose_no_solution, filter_courses_for_solve
+from src.filters import diagnose_no_solution, filter_courses_for_solve, suggest_fixes, format_suggestions
+from src.preferences import SchedulePreferences, filter_sections_for_preferences
 from src.selector import select_schedule
 
 console = Console()
@@ -183,6 +184,7 @@ def main() -> None:
         min_rating = 5.0
     max_sections_per_course = config.get("max_sections_per_course", 12)
     max_results = config.get("max_results", 100)
+    preferences = SchedulePreferences.from_dict(config.get("preferences"))
 
     solve_courses, filter_stats = filter_courses_for_solve(
         courses,
@@ -205,6 +207,18 @@ def main() -> None:
         for course in solve_courses:
             console.print(f"  {course.name}: {len(course.sections)} 个班")
 
+    if preferences.is_active():
+        solve_courses, pref_stats = filter_sections_for_preferences(solve_courses, preferences)
+        console.print("[bold]已启用课表偏好:[/bold]")
+        for line in preferences.summary_lines():
+            console.print(f"  • {line}")
+        if pref_stats.removed_early_morning:
+            console.print(
+                f"  [dim]剔除早八教学班: {pref_stats.removed_early_morning} 个[/dim]"
+            )
+    else:
+        pref_stats = None
+
     if filter_stats.removed_empty_courses:
         console.print(
             f"[yellow][!] {filter_stats.removed_empty_courses} 门课在剪枝后无可选教学班[/yellow]"
@@ -216,8 +230,8 @@ def main() -> None:
 
     # 5. 求解
     console.print(f"\n[bold]步骤 {'5' if use_ratings else '4'}/{'5' if use_ratings else '4'}: 求解无冲突课表[/bold]")
-    console.print(f"[dim]最多保留 {max_results} 种方案（按评分优先搜索）[/dim]")
-    results = solve(solve_courses, max_results=max_results)
+    console.print(f"[dim]最多保留 {max_results} 种方案（按评分与偏好优先搜索）[/dim]")
+    results = solve(solve_courses, max_results=max_results, preferences=preferences)
     print_solve_summary(solve_courses, results, max_results=max_results)
 
     if not results:
@@ -226,12 +240,22 @@ def main() -> None:
             console.print("[bold yellow]冲突诊断：[/bold yellow]")
             for hint in hints:
                 console.print(f"  • {hint}")
+        suggestions = suggest_fixes(
+            solve_courses,
+            max_results=max_results,
+            preferences=preferences,
+            all_courses=all_courses,
+        )
+        if suggestions:
+            console.print("[bold yellow]可尝试的调整：[/bold yellow]")
+            for msg in format_suggestions(suggestions):
+                console.print(f"  • {msg}")
             console.print()
 
     # 按 NCES 评分排序
     ranked: list[tuple] = []
     if use_ratings and results:
-        ranked = rank_schedules(results)
+        ranked = rank_schedules(results, preferences=preferences)
         results = [r[0] for r in ranked]
         console.print("[green]已按 NCES 评分总和从高到低排序[/green]\n")
         # 展示前 5 名摘要

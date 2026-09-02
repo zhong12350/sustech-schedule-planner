@@ -196,6 +196,34 @@
       </div>
 
       <div class="card">
+        <h2>课表偏好</h2>
+        <div class="checkbox-row">
+          <input type="checkbox" id="no_early_morning">
+          <label for="no_early_morning">不上早八（第 1 节）</label>
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="prefer_nearby_locations">
+          <label for="prefer_nearby_locations">优先同一天地点相近（排序加权）</label>
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="min_free_days_enable">
+          <label for="min_free_days_enable">每周至少</label>
+          <input type="number" id="min_free_days" value="1" min="1" max="4"
+                 style="width:4rem;margin:0 0.35rem;padding:0.35rem">
+          <label for="min_free_days" style="margin:0">天空课</label>
+        </div>
+        <div class="checkbox-row">
+          <label for="max_consecutive_periods" style="margin-right:0.35rem">同一天连堂不超过</label>
+          <input type="number" id="max_consecutive_periods" value="" min="2" max="8" placeholder="不限"
+                 style="width:4rem;margin:0 0.35rem;padding:0.35rem">
+          <label for="max_consecutive_periods" style="margin:0">节（留空不限制）</label>
+        </div>
+        <p style="color:var(--muted);font-size:0.8rem;margin-top:0.25rem">
+          偏好作为硬约束过滤方案；地点相近仅影响排序
+        </p>
+      </div>
+
+      <div class="card">
         <div class="checkbox-row">
           <input type="checkbox" id="use_ratings" checked>
           <label for="use_ratings">从牛娃课程评价社区 (NCES) 获取评分并排序</label>
@@ -296,6 +324,24 @@
       document.getElementById('error-box').style.display = 'none';
     }
 
+    function collectPreferences() {
+      const prefs = {};
+      if (document.getElementById('no_early_morning').checked) {
+        prefs.no_early_morning = true;
+      }
+      if (document.getElementById('prefer_nearby_locations').checked) {
+        prefs.prefer_nearby_locations = true;
+      }
+      if (document.getElementById('min_free_days_enable').checked) {
+        prefs.min_free_days = parseInt(document.getElementById('min_free_days').value, 10) || 1;
+      }
+      const maxConsec = document.getElementById('max_consecutive_periods').value.trim();
+      if (maxConsec) {
+        prefs.max_consecutive_periods = parseInt(maxConsec, 10);
+      }
+      return prefs;
+    }
+
     function formatTime(slots) {
       if (!slots || !slots.length) return '时间未知';
       return slots.map(s =>
@@ -319,7 +365,7 @@
       document.getElementById('results').style.display = 'none';
       document.getElementById('solve_btn').disabled = true;
 
-      const body = { courses, use_ratings };
+      const body = { courses, use_ratings, preferences: collectPreferences() };
       if (resolutions) {
         body.resolutions = resolutions;
         body.session_id = pendingSessionId;
@@ -421,7 +467,15 @@
       document.getElementById('semester_info').textContent = info;
 
       if (data.warnings && data.warnings.length) {
-        showWarning(data.warnings.join('；'));
+        showWarning(data.warnings.join('\n'));
+      }
+      if (data.suggestions && data.suggestions.length) {
+        const tip = document.createElement('div');
+        tip.className = 'warning';
+        tip.style.whiteSpace = 'pre-wrap';
+        tip.innerHTML = '<strong>可尝试的调整：</strong>\n' +
+          data.suggestions.map(s => '• ' + s.message).join('\n');
+        document.getElementById('schedule_list').prepend(tip);
       }
       if (data.not_found && data.not_found.length) {
         showWarning('未找到：' + data.not_found.join('、'));
@@ -440,7 +494,7 @@
           <div class="course-item">
             <div>
               <div class="course-name">${c.name}</div>
-              <div class="course-teacher">${c.teacher || '教师未知'}</div>
+              <div class="course-teacher">${c.teacher || '教师未知'}${c.location ? ' · ' + c.location : ''}</div>
             </div>
             <div class="course-time">
               ${c.rating != null

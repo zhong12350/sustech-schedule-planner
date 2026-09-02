@@ -26,6 +26,6 @@ env/
 .DS_Store
 Thumbs.db
 
-# 课程缓存
-course.txt
-user.txt
+# 自动生成的全校课表索引 & 匹配失败日志
+data/catalogs/
+data/match_misses.log

@@ -241,18 +241,28 @@ def score_schedule(schedule: list[Section]) -> tuple[float, int, int]:
 
 def rank_schedules(
     schedules: list[list[Section]],
+    preferences: SchedulePreferences | None = None,
 ) -> list[tuple[list[Section], float, int, int]]:
-    """按 NCES 评分总和从高到低排序课表方案。
+    """按 NCES 评分与偏好排序课表方案。
 
     Returns
     -------
     list[tuple[list[Section], float, int, int]]
-        (方案, 总分, 有评分数, 总课程数) 列表，按总分降序
+        (方案, 总分, 有评分数, 总课程数) 列表
     """
+    from .preferences import SchedulePreferences as Prefs, preference_sort_key
+
+    prefs = preferences or Prefs()
     scored = []
     for schedule in schedules:
         total, rated, count = score_schedule(schedule)
         scored.append((schedule, total, rated, count))
 
-    scored.sort(key=lambda x: (-x[1], -x[2]))
+    scored.sort(
+        key=lambda x: (
+            preference_sort_key(x[0], prefs),
+            -x[1],
+            -x[2],
+        )
+    )
     return scored
