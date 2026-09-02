@@ -123,6 +123,33 @@
     .step.active { color: var(--text); }
     footer { text-align: center; color: var(--muted); font-size: 0.8rem; margin-top: 2rem; }
     footer a { color: var(--accent); text-decoration: none; }
+    .modal-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+      z-index: 100; align-items: center; justify-content: center; padding: 1rem;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 1.5rem; max-width: 560px; width: 100%;
+      max-height: 80vh; overflow-y: auto;
+    }
+    .modal h3 { margin-bottom: 0.75rem; }
+    .modal p { color: var(--muted); font-size: 0.875rem; margin-bottom: 1rem; }
+    .ambig-group { margin-bottom: 1.25rem; }
+    .ambig-group label { color: var(--text); font-size: 0.9rem; margin-bottom: 0.5rem; }
+    .option-card {
+      display: block; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 0.5rem;
+      cursor: pointer; transition: border-color 0.15s;
+    }
+    .option-card:hover, .option-card.selected { border-color: var(--accent); }
+    .option-card input { margin-right: 0.5rem; }
+    .option-title { font-weight: 600; }
+    .option-meta { color: var(--muted); font-size: 0.8rem; margin-top: 0.25rem; }
+    .warning {
+      background: #422006; border: 1px solid var(--warning); color: #fde68a;
+      border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.875rem;
+    }
   </style>
 </head>
 <body>
@@ -178,6 +205,7 @@
     </div>
 
     <div id="error-box" class="error" style="display:none"></div>
+    <div id="warning-box" class="warning" style="display:none"></div>
     <div id="loading" class="loading" style="display:none">
       <div class="spinner"></div>
       <div>正在登录 TIS、获取课程数据并求解，请稍候…</div>
@@ -198,9 +226,21 @@
     </footer>
   </div>
 
+  <div id="disambig-modal" class="modal-overlay">
+    <div class="modal">
+      <h3>请选择具体课程</h3>
+      <p>以下输入匹配到了多个不同课程（可能来自不同院系），请确认你要选的是哪一个：</p>
+      <div id="ambig-content"></div>
+      <button class="btn btn-primary" style="margin-top:0.5rem" onclick="confirmDisambig()">确认并继续求解</button>
+    </div>
+  </div>
+
   <script>
     const WEEKDAYS = ['周一','周二','周三','周四','周五'];
     let courses = [];
+    let pendingSessionId = null;
+    let pendingAmbiguous = [];
+    let pendingResolutions = {};
 
     function addCourse() {
       const input = document.getElementById('course_input');
@@ -223,9 +263,27 @@
 
     function renderTags() {
       const el = document.getElementById('course_tags');
-      el.innerHTML = courses.map(c =>
-        `<span class="tag">${c}<button onclick="removeCourse('${c.replace(/'/g,"\\'")}')">×</button></span>`
-      ).join('');
+      el.innerHTML = '';
+      courses.forEach(c => {
+        const tag = document.createElement('span');
+        tag.className = 'tag';
+        tag.appendChild(document.createTextNode(c));
+        const btn = document.createElement('button');
+        btn.textContent = '×';
+        btn.onclick = () => removeCourse(c);
+        tag.appendChild(btn);
+        el.appendChild(tag);
+      });
+    }
+
+    function showWarning(msg) {
+      const box = document.getElementById('warning-box');
+      box.textContent = msg;
+      box.style.display = 'block';
+    }
+
+    function hideWarning() {
+      document.getElementById('warning-box').style.display = 'none';
     }
 
     function showError(msg) {
@@ -245,26 +303,47 @@
       ).join('、');
     }
 
-    async function solve() {
+    async function solve(resolutions = null) {
       hideError();
+      hideWarning();
       const student_id = document.getElementById('student_id').value.trim();
       const password = document.getElementById('password').value;
       const use_ratings = document.getElementById('use_ratings').checked;
 
-      if (!student_id || !password) { showError('请填写学号和密码'); return; }
-      if (!courses.length) { showError('请至少添加一门课程'); return; }
+      if (!resolutions) {
+        if (!student_id || !password) { showError('请填写学号和密码'); return; }
+        if (!courses.length) { showError('请至少添加一门课程'); return; }
+      }
 
       document.getElementById('loading').style.display = 'block';
       document.getElementById('results').style.display = 'none';
       document.getElementById('solve_btn').disabled = true;
 
+      const body = { courses, use_ratings };
+      if (resolutions) {
+        body.resolutions = resolutions;
+        body.session_id = pendingSessionId;
+      } else {
+        body.student_id = student_id;
+        body.password = password;
+      }
+
       try {
         const resp = await fetch('/api/solve', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ student_id, password, courses, use_ratings }),
+          body: JSON.stringify(body),
         });
         const data = await resp.json();
+
+        if (data.needs_disambiguation) {
+          pendingSessionId = data.session_id;
+          pendingAmbiguous = data.ambiguous;
+          pendingResolutions = {};
+          showDisambigModal(data);
+          return;
+        }
+
         if (!data.ok) { showError(data.error || '求解失败'); return; }
         renderResults(data);
       } catch (e) {
@@ -275,13 +354,78 @@
       }
     }
 
+    function showDisambigModal(data) {
+      const content = document.getElementById('ambig-content');
+      content.innerHTML = '';
+      pendingResolutions = {};
+
+      data.ambiguous.forEach(group => {
+        const div = document.createElement('div');
+        div.className = 'ambig-group';
+        const label = document.createElement('label');
+        label.textContent = `「${group.query}」对应：`;
+        div.appendChild(label);
+
+        group.options.forEach((opt, i) => {
+          const card = document.createElement('label');
+          card.className = 'option-card' + (i === 0 ? ' selected' : '');
+          const input = document.createElement('input');
+          input.type = 'radio';
+          input.name = 'ambig-' + group.query;
+          input.value = opt.identity;
+          input.checked = i === 0;
+          input.onchange = () => {
+            pendingResolutions[group.query] = opt.identity;
+            div.querySelectorAll('.option-card').forEach(c => c.classList.remove('selected'));
+            card.classList.add('selected');
+          };
+          card.appendChild(input);
+          const title = document.createElement('div');
+          title.className = 'option-title';
+          title.textContent = opt.identity;
+          card.appendChild(title);
+          const meta = document.createElement('div');
+          meta.className = 'option-meta';
+          const teachers = opt.teachers.length ? opt.teachers.join('、') : '教师未知';
+          meta.textContent = `${opt.section_count} 个教学班 · 相似度 ${Math.round(opt.score * 100)}% · ${teachers}`;
+          card.appendChild(meta);
+          div.appendChild(card);
+          if (i === 0) pendingResolutions[group.query] = opt.identity;
+        });
+        content.appendChild(div);
+      });
+
+      if (data.not_found && data.not_found.length) {
+        showWarning('以下课程未找到，将不参与求解：' + data.not_found.join('、'));
+      }
+
+      document.getElementById('disambig-modal').classList.add('show');
+    }
+
+    function confirmDisambig() {
+      document.getElementById('disambig-modal').classList.remove('show');
+      solve(pendingResolutions);
+    }
+
     function renderResults(data) {
       document.getElementById('form-section').style.display = 'none';
       document.getElementById('results').style.display = 'block';
       document.getElementById('result_count').textContent = data.total + ' 种方案';
-      document.getElementById('semester_info').textContent =
-        (data.semester ? data.semester + ' · ' : '') +
-        (data.message || '已按 NCES 评分总和从高到低排序，点击方案查看详情');
+
+      let info = (data.semester ? data.semester + ' · ' : '');
+      if (data.matched_count != null && data.requested_count != null
+          && data.matched_count < data.requested_count) {
+        info += `已匹配 ${data.matched_count}/${data.requested_count} 门课 · `;
+      }
+      info += (data.message || '已按 NCES 评分总和从高到低排序，点击方案查看详情');
+      document.getElementById('semester_info').textContent = info;
+
+      if (data.warnings && data.warnings.length) {
+        showWarning(data.warnings.join('；'));
+      }
+      if (data.not_found && data.not_found.length) {
+        showWarning('未找到：' + data.not_found.join('、'));
+      }
 
       const list = document.getElementById('schedule_list');
       if (!data.schedules || !data.schedules.length) {
@@ -330,6 +474,8 @@
       document.getElementById('form-section').style.display = 'block';
       document.getElementById('results').style.display = 'none';
       hideError();
+      hideWarning();
+      pendingSessionId = null;
     }
   </script>
 </body>

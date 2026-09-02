@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 # 去掉 "-01班-..." 或末尾 "1班" 及之后的内容
@@ -14,8 +16,34 @@ _TRAILING_NUMERAL = re.compile(
     r"(I{1,3}V?|IV|VI{0,3}|IX|X|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+|\d+)$"
 )
 
+# 连接词：不同院系可能开设名称仅差一字（如 信号与系统 vs 信号和系统）
+_CONNECTIVE_CHARS = frozenset("与和及")
+
 # 默认相似度阈值：略宽松以覆盖轻微错别字，后缀不一致会直接否决
 DEFAULT_MATCH_THRESHOLD = 0.72
+
+
+@dataclass
+class MatchOption:
+    """一个可匹配的课程身份（可能对应多个教学班 key）。"""
+
+    identity: str
+    keys: list[str] = field(default_factory=list)
+    score: float = 0.0
+    section_count: int = 0
+    teachers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CourseMatchResult:
+    """单门用户输入课程的匹配结果。"""
+
+    query: str
+    status: str  # "exact" | "matched" | "ambiguous" | "not_found"
+    keys: list[str] = field(default_factory=list)
+    score: float = 0.0
+    options: list[MatchOption] = field(default_factory=list)
+    near_misses: list[tuple[str, float]] = field(default_factory=list)
 
 
 def normalize_course_name(name: str) -> str:
@@ -58,6 +86,26 @@ def _char_overlap_ratio(a: str, b: str) -> float:
     return intersection / union if union else 0.0
 
 
+def connectives_compatible(query: str, candidate: str) -> bool:
+    """连接词（与/和/及）必须一致，避免不同院系同名课误匹配。"""
+    q_norm = normalize_course_name(query)
+    c_norm = normalize_course_name(candidate)
+    if len(q_norm) != len(c_norm):
+        # 长度不同但含连接词时，检查较短串中的连接词是否在较长串同位置一致
+        shorter, longer = (q_norm, c_norm) if len(q_norm) <= len(c_norm) else (c_norm, q_norm)
+        if any(ch in _CONNECTIVE_CHARS for ch in shorter):
+            for i, ch in enumerate(shorter):
+                if ch in _CONNECTIVE_CHARS and longer[i] != ch:
+                    return False
+        return True
+
+    for qc, cc in zip(q_norm, c_norm):
+        if qc in _CONNECTIVE_CHARS or cc in _CONNECTIVE_CHARS:
+            if qc != cc:
+                return False
+    return True
+
+
 def suffix_compatible(
     q_norm: str,
     q_suffix: str,
@@ -81,6 +129,9 @@ def match_score(query: str, candidate: str) -> float:
     q_norm = normalize_course_name(query)
     c_norm = normalize_course_name(candidate)
     if not q_norm or not c_norm:
+        return 0.0
+
+    if not connectives_compatible(query, candidate):
         return 0.0
 
     q_base, q_suffix = split_base_and_suffix(q_norm)
@@ -132,16 +183,169 @@ def find_matching_course_keys(
     return scored
 
 
+def group_keys_by_identity(keys: list[str], query: str | None = None) -> dict[str, list[str]]:
+    """按规范化课名将 TIS key 分组（同一门课的不同教学班）。
+
+    若用户输入是候选名的前缀（如 体育Ⅴ -> 体育Ⅴ-中文-乒乓球...），
+    归入同一组而非按子项目拆分。
+    """
+    groups: dict[str, list[str]] = defaultdict(list)
+    q_norm = normalize_course_name(query) if query else ""
+    for key in keys:
+        identity = normalize_course_name(key)
+        if q_norm and (identity.startswith(q_norm) or q_norm == identity):
+            identity = q_norm
+        groups[identity].append(key)
+    return dict(groups)
+
+
+def _build_options(
+    groups: dict[str, list[str]],
+    scored_map: dict[str, float],
+    section_meta: dict[str, list] | None = None,
+) -> list[MatchOption]:
+    """从分组构建 MatchOption 列表，按得分降序。"""
+    options: list[MatchOption] = []
+    for identity, keys in groups.items():
+        score = max(scored_map.get(k, 0.0) for k in keys)
+        teachers: list[str] = []
+        if section_meta:
+            section_count = sum(len(section_meta.get(k, [])) for k in keys)
+            seen_teachers: set[str] = set()
+            for key in keys:
+                for sec in section_meta.get(key, []):
+                    teacher = getattr(sec, "teacher", "") or ""
+                    if teacher and teacher not in seen_teachers:
+                        seen_teachers.add(teacher)
+                        teachers.append(teacher)
+        else:
+            section_count = len(keys)
+        options.append(
+            MatchOption(
+                identity=identity,
+                keys=keys,
+                score=score,
+                section_count=section_count,
+                teachers=teachers[:5],
+            )
+        )
+    options.sort(key=lambda o: (-o.score, o.identity))
+    return options
+
+
+def resolve_course_match(
+    query: str,
+    available_keys: list[str],
+    *,
+    threshold: float = DEFAULT_MATCH_THRESHOLD,
+    section_meta: dict[str, list] | None = None,
+    chosen_identity: str | None = None,
+) -> CourseMatchResult:
+    """解析单门课的匹配结果，必要时标记歧义。
+
+    Parameters
+    ----------
+    query : str
+        用户输入的课程名
+    available_keys : list[str]
+        TIS 全部课程 key
+    threshold : float
+        相似度阈值
+    section_meta : dict | None
+        key -> Section 列表，用于展示教师等信息
+    chosen_identity : str | None
+        用户已选择的课程身份（歧义消解后）
+    """
+    query = query.strip()
+    if not query:
+        return CourseMatchResult(query=query, status="not_found")
+
+    # 精确 key 匹配
+    if query in available_keys:
+        return CourseMatchResult(
+            query=query,
+            status="exact",
+            keys=[query],
+            score=1.0,
+        )
+
+    scored = find_matching_course_keys(query, available_keys, threshold)
+    if not scored:
+        near = find_matching_course_keys(query, available_keys, threshold=0.5)
+        return CourseMatchResult(
+            query=query,
+            status="not_found",
+            near_misses=near[:5],
+        )
+
+    scored_map = {key: score for key, score in scored}
+    groups = group_keys_by_identity([key for key, _ in scored], query=query)
+
+    # 用户已选择
+    if chosen_identity:
+        if chosen_identity in groups:
+            keys = groups[chosen_identity]
+            return CourseMatchResult(
+                query=query,
+                status="matched",
+                keys=keys,
+                score=max(scored_map[k] for k in keys),
+            )
+        # 按规范化名查找
+        for identity, keys in groups.items():
+            if identity == chosen_identity or normalize_course_name(chosen_identity) == identity:
+                return CourseMatchResult(
+                    query=query,
+                    status="matched",
+                    keys=keys,
+                    score=max(scored_map[k] for k in keys),
+                )
+
+    options = _build_options(groups, scored_map, section_meta)
+
+    # 查询名与某一 identity 完全一致 -> 唯一匹配
+    q_norm = normalize_course_name(query)
+    if q_norm in groups and len(groups) == 1:
+        keys = groups[q_norm]
+        return CourseMatchResult(
+            query=query,
+            status="matched",
+            keys=keys,
+            score=max(scored_map[k] for k in keys),
+        )
+
+    # 只有一个候选身份
+    if len(groups) == 1:
+        keys = next(iter(groups.values()))
+        return CourseMatchResult(
+            query=query,
+            status="matched",
+            keys=keys,
+            score=options[0].score,
+        )
+
+    # 多个候选身份 -> 歧义
+    return CourseMatchResult(
+        query=query,
+        status="ambiguous",
+        options=options,
+        score=options[0].score,
+    )
+
+
 def pick_best_match_group(
     query: str,
     available_keys: list[str],
     threshold: float = DEFAULT_MATCH_THRESHOLD,
 ) -> tuple[list[str], float]:
-    """返回所有达标的 TIS key（同一门课的多个教学班会各自占一个 key）。"""
-    scored = find_matching_course_keys(query, available_keys, threshold)
-    if not scored:
-        return [], 0.0
+    """返回所有达标的 TIS key（同一门课的多个教学班会各自占一个 key）。
 
-    best_keys = [key for key, _ in scored]
-    best_score = scored[0][1]
-    return best_keys, best_score
+    若存在多个不同课程身份且未消解，仅返回得分最高的一组（向后兼容）。
+    推荐使用 resolve_course_match 获取完整歧义信息。
+    """
+    result = resolve_course_match(query, available_keys, threshold=threshold)
+    if result.status in ("exact", "matched"):
+        return result.keys, result.score
+    if result.status == "ambiguous" and result.options:
+        return result.options[0].keys, result.options[0].score
+    return [], 0.0

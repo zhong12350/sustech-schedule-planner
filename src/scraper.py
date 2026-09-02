@@ -11,7 +11,8 @@ import requests
 from urllib3.exceptions import InsecureRequestWarning
 
 from .models import Course, Section, TimeSlot, WEEKDAY_MAP
-from .course_match import find_matching_course_keys, pick_best_match_group
+from .course_match import find_matching_course_keys
+from .course_selection import SelectionResult, match_courses_from_catalog, prompt_disambiguation
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
@@ -274,7 +275,10 @@ def get_courses_for_selection(
     headers: dict[str, str],
     semester_info: dict,
     wanted_course_names: list[str],
-) -> list[Course]:
+    *,
+    resolutions: dict[str, str] | None = None,
+    all_courses: dict[str, list[Section]] | None = None,
+) -> SelectionResult:
     """获取用户想选的课程及其所有教学班。
 
     Parameters
@@ -285,14 +289,19 @@ def get_courses_for_selection(
         学期信息
     wanted_course_names : list[str]
         用户想选的课程名列表
+    resolutions : dict[str, str] | None
+        歧义消解：用户输入 -> 选定的课程 identity
+    all_courses : dict | None
+        已缓存的 TIS 课程目录（避免重复拉取）
 
     Returns
     -------
-    list[Course]
-        每门课包含所有可选教学班信息
+    SelectionResult
+        匹配结果，含 courses / not_found / ambiguous
     """
-    print("[*] 从 TIS 获取课程数据...")
-    all_courses = fetch_all_courses(headers, semester_info)
+    if all_courses is None:
+        print("[*] 从 TIS 获取课程数据...")
+        all_courses = fetch_all_courses(headers, semester_info)
 
     # 硬编码：TIS API 无法查到但确实存在的课程
     _HARDCODED: dict[str, list[Section]] = {
@@ -302,7 +311,7 @@ def get_courses_for_selection(
                 section_name="数理逻辑导论-01班-英文 - 陶伊达",
                 section_id="CS104-01",
                 course_type="zynknjxk",
-                time_slots=[TimeSlot(weekday=2, start_period=3, end_period=4)],  # 星期三第3-4节
+                time_slots=[TimeSlot(weekday=2, start_period=3, end_period=4)],
                 teacher="陶伊达",
             ),
         ],
@@ -312,58 +321,25 @@ def get_courses_for_selection(
             all_courses[hc_name] = hc_sections
             print(f"  [*] 补充硬编码课程: {hc_name}")
 
-    result: list[Course] = []
-    not_found: list[str] = []
-    all_keys = list(all_courses.keys())
+    selection = match_courses_from_catalog(
+        wanted_course_names,
+        all_courses,
+        resolutions=resolutions,
+    )
 
-    for name in wanted_course_names:
-        name = name.strip()
-        if not name:
-            continue
+    for line in selection.match_log:
+        print(f"  [*] {line}")
 
-        # 1. 精确 key 匹配
-        if name in all_courses:
-            sections = all_courses[name]
-            result.append(Course(name=name, sections=sections))
-            continue
-
-        # 2. 相似度匹配（规范化 + 字符重合 + 罗马数字后缀校验）
-        matched_keys, best_score = pick_best_match_group(name, all_keys)
-        if matched_keys:
-            all_sections: list[Section] = []
-            for key in matched_keys:
-                all_sections.extend(all_courses[key])
-            if len(matched_keys) == 1:
-                display_name = matched_keys[0]
-                print(
-                    f"  [*] 相似度匹配 ({best_score:.0%}): "
-                    f"\"{name}\" -> \"{display_name}\""
-                )
-            else:
-                print(
-                    f"  [*] 相似度匹配 ({best_score:.0%}): "
-                    f"\"{name}\" -> {len(matched_keys)} 个教学班组"
-                )
-            for sec in all_sections[:5]:
-                slots_str = ", ".join(str(ts) for ts in sec.time_slots) or "时间未知"
-                print(f"      - {sec.section_name} [{slots_str}]")
-            if len(all_sections) > 5:
-                print(f"      ... 共 {len(all_sections)} 个教学班")
-            result.append(Course(name=name, sections=all_sections))
-            continue
-
-        # 3. 兜底：列出最接近的候选，方便用户改 config
-        near = find_matching_course_keys(name, all_keys, threshold=0.5)
-        not_found.append(name)
-        if near:
-            print(f"  [?] \"{name}\" 未达到匹配阈值，最接近的候选:")
-            for key, score in near[:3]:
-                print(f"      - {key}  (相似度 {score:.0%})")
-
-    if not_found:
+    if selection.not_found:
         print(f"\n[!] 以下课程未在 TIS 中找到:")
-        for name in not_found:
+        for name in selection.not_found:
             print(f"    - {name}")
         print("    请检查课程名是否与 TIS 系统中的完全一致\n")
 
-    return result
+    if selection.ambiguous:
+        print(f"\n[?] 以下课程存在歧义，需要确认:")
+        for match in selection.ambiguous:
+            ids = " / ".join(o.identity for o in match.options)
+            print(f"    - \"{match.query}\" 可能指: {ids}")
+
+    return selection

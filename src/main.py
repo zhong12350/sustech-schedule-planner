@@ -16,7 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.auth import interactive_login, cas_login
-from src.scraper import get_semester_info, get_courses_for_selection
+from src.scraper import get_semester_info, get_courses_for_selection, fetch_all_courses
+from src.course_selection import prompt_disambiguation
 from src.solver import solve, print_solve_summary
 from src.display import display_all_schedules, display_schedule
 from src.ratings import enrich_courses_with_ratings, rank_schedules, score_schedule
@@ -133,10 +134,31 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        courses = get_courses_for_selection(headers, semester_info, wanted_courses)
+        all_courses = fetch_all_courses(headers, semester_info)
+        selection = get_courses_for_selection(
+            headers,
+            semester_info,
+            wanted_courses,
+            all_courses=all_courses,
+        )
+        while selection.ambiguous:
+            resolutions = prompt_disambiguation(selection.ambiguous)
+            selection = get_courses_for_selection(
+                headers,
+                semester_info,
+                wanted_courses,
+                resolutions=resolutions,
+                all_courses=all_courses,
+            )
+        courses = selection.courses
     except Exception as e:
         console.print(f"[red]获取课程数据失败: {e}[/red]")
         sys.exit(1)
+
+    if selection.not_found:
+        console.print(
+            f"[yellow]警告: {len(selection.not_found)} 门课未找到，将不参与求解[/yellow]"
+        )
 
     if not courses:
         console.print("[red]未能获取到任何课程信息，请检查课程名是否正确[/red]")
